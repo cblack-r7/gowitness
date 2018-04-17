@@ -45,6 +45,8 @@ var (
 	scanCidr           []string
 	scanFileCidr       string
 	scanPorts          string
+	scanNmapFile       string
+	scanNmapServices   string
 	skipHTTP           bool
 	skipHTTPS          bool
 	randomPermutations bool
