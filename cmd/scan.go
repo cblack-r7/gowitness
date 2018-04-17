@@ -2,8 +2,11 @@ package cmd
 
 import (
 	"bufio"
+	"fmt"
+	"io/ioutil"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"text/template"
@@ -15,6 +18,7 @@ import (
 	"github.com/remeh/sizedwaitgroup" // <3
 	"github.com/sensepost/gowitness/utils"
 	"github.com/spf13/cobra"
+	"github.com/tomsteele/go-nmap"
 )
 
 // scanCmd represents the scan command
@@ -32,6 +36,10 @@ At least one --cidr flag or the --cidr-file flag (or both) should be specified.
 If the subnet is omitted, it will be assumed that this is a /32. Multiple --cidr
 flags are accepted.
 
+If the --nmap-xml flag is set, the --cidr, --cidr-file, and --ports flags are ignored and the 
+--nmap-services flag matches the nmap services and connects to HTTP and or HTTPS urls
+in addition to the --ports arguments for processing.
+
 When specifying the --random/-r flag, the ip:port permutations that are
 generated will go through a shuffling phase so that the resultant
 requests that are made wont follow each other on the same host.
@@ -45,57 +53,87 @@ $ gowitness scan --cidr 192.168.0.0/24 --cidr 10.10.0.0/24
 $ gowitness scan --threads 20 --ports 80,443,8080 --cidr 192.168.0.0/24
 $ gowitness scan --threads 20 --ports 80,443,8080 --cidr 192.168.0.1/32 --no-https
 $ gowitness --log-level debug scan --threads 20 --ports 80,443,8080 --no-http --cidr 192.168.0.0/30
+$ gowitness scan --nmap-xml ./scan.xml --nmap-services https,http,http-alt
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 
+		var permutations []string
 		validateScanCmdFlags()
-
-		ports, _ := utils.Ports(scanPorts)
-		log.WithField("ports", ports).Debug("Using ports")
-
-		if len(ports) <= 0 {
-			log.WithField("ports", scanPorts).Fatal("Please specify at least one port to connect to")
-			return
-		}
-
-		var ips []string
-		cidrs := readCidrs()
-		log.WithField("cidr-count", len(cidrs)).Debug("Using CIDR ranges")
-
-		// loop and parse the --cidr flags we got
-		for _, cidr := range cidrs {
-
-			if !strings.Contains(cidr, "/") {
-				log.WithFields(log.Fields{"cidr": cidr}).Warning("CIDR does not have a subnet, assuming /32")
-				cidr = cidr + "/32"
-			}
-
-			// parse the cidr
-			cidrIps, err := utils.Hosts(cidr)
+		if scanNmapFile != "" {
+			log.WithField("nmap", scanNmapFile).Debug("Using nmap file")
+			xml, err := ioutil.ReadFile(scanNmapFile)
 			if err != nil {
-				log.WithFields(log.Fields{"cidr": cidr, "error": err}).Fatal("Failed to parse CIDR")
+				log.WithFields(log.Fields{"file": scanFileCidr, "err": err}).Fatal("Error reading nmap file")
+			}
+			nr, err := nmap.Parse(xml)
+			if err != nil {
+				log.WithFields(log.Fields{"parser": scanFileCidr, "err": err}).Fatal("Error parsing nmap file")
+			}
+			nu, err := utils.NmapUrls(*nr, strings.Split(scanNmapServices, ","))
+			if err != nil {
+				log.WithFields(log.Fields{"parser": scanFileCidr, "err": err}).Fatal("Error parsing nmap url")
+			}
+			for _, nh := range nu {
+				port, err := strconv.Atoi(strings.Split(nh, ":")[1])
+				p, err := utils.Permutations([]string{strings.Split(nh, ":")[0]}, []int{port}, skipHTTP, skipHTTPS)
+				if err != nil {
+					//TODO
+					log.WithField("ports", scanPorts).Fatal("Please specify at least one port to connect to")
+					return
+				}
+				permutations = append(permutations, p...)
+			}
+			fmt.Printf("%#v\n", permutations)
+		}
+		if scanNmapFile == "" {
+			ports, _ := utils.Ports(scanPorts)
+			log.WithField("ports", ports).Debug("Using ports")
+
+			if len(ports) <= 0 {
+				log.WithField("ports", scanPorts).Fatal("Please specify at least one port to connect to")
 				return
 			}
 
-			// append the ips from the current cidr
-			log.WithFields(log.Fields{"cidr": cidr, "cidr-ips": len(cidrIps)}).Debug("Appending cidr")
-			ips = append(ips, cidrIps...)
+			var ips []string
+			cidrs := readCidrs()
+			log.WithField("cidr-count", len(cidrs)).Debug("Using CIDR ranges")
+
+			// loop and parse the --cidr flags we got
+			for _, cidr := range cidrs {
+
+				if !strings.Contains(cidr, "/") {
+					log.WithFields(log.Fields{"cidr": cidr}).Warning("CIDR does not have a subnet, assuming /32")
+					cidr = cidr + "/32"
+				}
+
+				// parse the cidr
+				cidrIps, err := utils.Hosts(cidr)
+				if err != nil {
+					log.WithFields(log.Fields{"cidr": cidr, "error": err}).Fatal("Failed to parse CIDR")
+					return
+				}
+
+				// append the ips from the current cidr
+				log.WithFields(log.Fields{"cidr": cidr, "cidr-ips": len(cidrIps)}).Debug("Appending cidr")
+				ips = append(ips, cidrIps...)
+			}
+
+			log.WithFields(log.Fields{"total-ips": len(ips)}).Debug("Finished parsing CIDR ranges")
+
+			var err error
+			permutations, err = utils.Permutations(ips, ports, skipHTTP, skipHTTPS)
+			if err != nil {
+				log.WithFields(log.Fields{
+					"skip-http": skipHTTP, "skip-https": skipHTTPS, "ports": ports, "error": err,
+				}).Fatal("Failed building permutations")
+			}
 		}
-
-		log.WithFields(log.Fields{"total-ips": len(ips)}).Debug("Finished parsing CIDR ranges")
-
-		permutations, err := utils.Permutations(ips, ports, skipHTTP, skipHTTPS)
-
 		if randomPermutations {
-			log.WithFields(log.Fields{"cidr-count": len(cidrs)}).Info("Randomizing permutations")
+			//TODO
+			//log.WithFields(log.Fields{"cidr-count": len(cidrs)}).Info("Randomizing permutations")
 			permutations = utils.ShufflePermutations(permutations)
 		}
 
-		if err != nil {
-			log.WithFields(log.Fields{
-				"skip-http": skipHTTP, "skip-https": skipHTTPS, "ports": ports, "error": err,
-			}).Fatal("Failed building permutations")
-		}
 		log.WithField("permutation-count", len(permutations)).Info("Total permutations to be processed")
 
 		// Start processing the calculated permutations
@@ -188,7 +226,7 @@ func readCidrs() []string {
 func validateScanCmdFlags() {
 
 	// Ensure we have at least a CIDR
-	if len(scanCidr) == 0 && scanFileCidr == "" {
+	if len(scanCidr) == 0 && scanFileCidr == "" && scanNmapFile == "" {
 		log.WithFields(log.Fields{"cidr": scanCidr, "file-cidr": scanFileCidr}).
 			Fatal("At least one --cidr or the --file-cidr flag is required")
 	}
@@ -210,4 +248,6 @@ func init() {
 	scanCmd.Flags().StringVarP(&scanPorts, "ports", "p", "80,443,8080,8443", "Ports to scan")
 	scanCmd.Flags().IntVarP(&maxThreads, "threads", "t", 4, "Maximum concurrent threads to run")
 	scanCmd.Flags().BoolVarP(&randomPermutations, "random", "r", false, "Randomize generated permutations")
+	scanCmd.Flags().StringVarP(&scanNmapFile, "nmap-xml", "n", "", "XML nmap file to injest")
+	scanCmd.Flags().StringVarP(&scanNmapServices, "nmap-services", "e", "http,http-mgmt,https,http-alt,http-proxy,https-alt,httpx", "Nmap services to mark fingerprint as web services")
 }
